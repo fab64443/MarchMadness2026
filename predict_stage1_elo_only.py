@@ -99,7 +99,7 @@ def k_factor_advanced(margin, elo_diff, k_base=ELO_K):
     return k_base * mov_mult * elo_corr
     
     
-def compute_elo(results_df, inter_season, initial=ELO_INITIAL):
+def compute_elo_OLD(results_df, inter_season, initial=ELO_INITIAL):
     """
     Calcule les ratings ELO pour chaque équipe et chaque saison.
 
@@ -166,6 +166,71 @@ def compute_elo(results_df, inter_season, initial=ELO_INITIAL):
     return elo_history
 
 
+def compute_elo(results_df, inter_season, initial=1500):
+
+    elo_current = {}
+    elo_history = {}
+
+    current_season = None
+
+    df = results_df.sort_values(["Season", "DayNum"])
+
+    for row in df.itertuples(index=False):
+
+        s = row.Season
+        w = row.WTeamID
+        l = row.LTeamID
+
+        # ─────────────────────────────
+        # Changement de saison
+        # ─────────────────────────────
+        if s != current_season:
+
+            if current_season is not None:
+
+                # Sauvegarde rapide
+                elo_history.update({
+                    (current_season, team): rating
+                    for team, rating in elo_current.items()
+                })
+
+                # Régression vectorisée
+                elo_current = {
+                    team: rating * (1 - inter_season) + initial * inter_season
+                    for team, rating in elo_current.items()
+                }
+
+            current_season = s
+
+        # ─────────────────────────────
+        # Récupération ELO
+        # ─────────────────────────────
+        elo_w = elo_current.get(w, initial)
+        elo_l = elo_current.get(l, initial)
+
+        # ─────────────────────────────
+        # Update
+        # ─────────────────────────────
+        exp_w = 1.0 / (1.0 + 10 ** ((elo_l - elo_w) / 400))
+
+        margin = row.WScore - row.LScore
+        k = k_factor_advanced(margin, elo_w - elo_l)
+
+        elo_current[w] = elo_w + k * (1.0 - exp_w)
+        elo_current[l] = elo_l - k * (1.0 - exp_w)
+
+    # ─────────────────────────────
+    # Dernière saison
+    # ─────────────────────────────
+    if current_season is not None:
+        elo_history.update({
+            (current_season, team): rating
+            for team, rating in elo_current.items()
+        })
+
+    return elo_history
+
+    
 def build_combined_elo(m_reg, w_reg, inter_season):
     """
     Calcule l'ELO séparément pour les hommes et les femmes,
@@ -295,46 +360,82 @@ def analyze_predictions(model, train_df):
 # 6. GÉNÉRATION DE LA SOUMISSION
 # ─────────────────────────────────────────────
 
-def generate_submission(sample_all, elo_dict, model, output_path):
+def generate_submission(sample_all, elo_dict, model, output_path, clip):
     """
-    Prédit P(t1 bat t2) pour tous les matchups du fichier sample.
-
-    Fallback si ELO manquant : 0.5 (neutre)
-    Les seeds ne sont pas encore connus → on ne peut pas les utiliser.
+    Version vectorisée.
+    Prédit P(t1 bat t2) pour tous les matchups.
+    Fallback = 0.5 si ELO manquant.
     """
-    new_ids   = []
-    preds     = []
-    n_elo     = 0
-    n_neutral = 0
 
-    # sample_sub = sample_all[sample_all["ID"].str.startswith(f"{current_season}_")]
-    # Prédictions pour les saisons 2022-2025
-    sample_sub = sample_all
+    df = sample_all.copy()
 
-    for _, row in tqdm(sample_sub.iterrows(), total=len(sample_sub), mininterval=2, dynamic_ncols=True):        
-        parts = row["ID"].split("_")
-        s  = int(parts[0])
-        t1 = int(parts[1])   # garanti t1 < t2 par Kaggle
-        t2 = int(parts[2])
+    # ─────────────────────────────────────
+    # 1. Split ID vectorisé
+    # ─────────────────────────────────────
+    id_split = df["ID"].str.split("_", expand=True)
 
-        elo1 = elo_dict.get((s, t1))
-        elo2 = elo_dict.get((s, t2))
+    df["Season"] = id_split[0].astype(int)
+    df["Team1"]  = id_split[1].astype(int)  # t1 < t2 garanti
+    df["Team2"]  = id_split[2].astype(int)
 
-        if elo1 is not None and elo2 is not None:
-            diff = np.array([[elo1 - elo2]])
-            p    = model.predict_proba(diff)[0][1]
-            p    = float(np.clip(p, 0.025, 0.975))
-            n_elo += 1
-        else:
-            # ELO de la saison en cours pas encore disponible
-            # → probabilité neutre
-            p = 0.5
-            n_neutral += 1
+    # ─────────────────────────────────────
+    # 2. Transformer elo_dict → DataFrame
+    # ─────────────────────────────────────
+    elo_df = (
+        pd.DataFrame(
+            [(s, t, e) for (s, t), e in elo_dict.items()],
+            columns=["Season", "TeamID", "elo"]
+        )
+    )
 
-        preds.append(p)
+    # ─────────────────────────────────────
+    # 3. Merge ELO Team1
+    # ─────────────────────────────────────
+    df = df.merge(
+        elo_df,
+        left_on=["Season", "Team1"],
+        right_on=["Season", "TeamID"],
+        how="left"
+    ).rename(columns={"elo": "elo1"}).drop(columns=["TeamID"])
 
-    result = sample_sub.copy()
-    result["Pred"] = preds
+    # ─────────────────────────────────────
+    # 4. Merge ELO Team2
+    # ─────────────────────────────────────
+    df = df.merge(
+        elo_df,
+        left_on=["Season", "Team2"],
+        right_on=["Season", "TeamID"],
+        how="left"
+    ).rename(columns={"elo": "elo2"}).drop(columns=["TeamID"])
+
+    # ─────────────────────────────────────
+    # 5. Calcul diff ELO
+    # ─────────────────────────────────────
+    df["elo_diff"] = df["elo1"] - df["elo2"]
+
+    # Matchups valides (ELO dispo pour les deux équipes)
+    mask_valid = df["elo_diff"].notna()
+
+    n_elo     = mask_valid.sum()
+    n_neutral = len(df) - n_elo
+
+    # ─────────────────────────────────────
+    # 6. Prédiction batch
+    # ─────────────────────────────────────
+    preds = np.full(len(df), 0.5)
+
+    if n_elo > 0:
+        X_valid = df.loc[mask_valid, ["elo_diff"]].values
+        p_valid = model.predict_proba(X_valid)[:, 1]
+        p_valid = np.clip(p_valid, clip, 1 - clip)
+        preds[mask_valid] = p_valid
+
+    df["Pred"] = preds
+
+    # ─────────────────────────────────────
+    # 7. Export
+    # ─────────────────────────────────────
+    result = df[["ID", "Pred"]]
     result.to_csv(output_path, index=False)
 
     print(f"  ✅ Fichier sauvegardé     : {output_path}")
@@ -344,13 +445,13 @@ def generate_submission(sample_all, elo_dict, model, output_path):
 
     return result
 
-
+    
 
 # ─────────────────────────────────────────────
 # 7. PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
 
-def evaluate(submission_path, start_season, inter_season, data_dir):
+def evaluate(submission_path, start_season, inter_season, clip, data_dir):
     print("=" * 55)
     print("  March Mania 2026 — Modèle ELO Only")
     print("=" * 55)
@@ -384,7 +485,7 @@ def evaluate(submission_path, start_season, inter_season, data_dir):
 
     # ── Soumission ──────────────────────────────
     print("\n[4/4] Génération de la soumission...")
-    sub = generate_submission(sample_all, elo_dict, model, submission_path)
+    sub = generate_submission(sample_all, elo_dict, model, submission_path, clip)
 
     metrics = {
         "mean"    : sub['Pred'].mean(),
@@ -399,12 +500,6 @@ def evaluate(submission_path, start_season, inter_season, data_dir):
     print(f"   Proba médiane  : {metrics['median']:.4f}")
     print(f"   Écart-type     : {metrics['std']:.4f}")
     print(f"   Min / Max      : {metrics['min']:.4f} / {metrics['max']:.4f}")
-
-    print("\n💡 Notes importantes :")
-    print("   - ELO calculé sur saison régulière uniquement (pas de leakage)")
-    print("   - Régression inter-saisons : 70% ELO précédent + 30% moyenne")
-    print("   - Hommes et femmes traités séparément puis fusionnés")
-    print("   - Sélectionner manuellement vos 2 meilleures soumissions !")
 
     return model, sub, metrics
 
@@ -458,6 +553,12 @@ if __name__ == "__main__":
         help="Regression inter-saison (défaut: 0.3)"
     )
     parser.add_argument(
+        "--clip",
+        type=float_range(0.0001, 0.05),
+        default=0.025,
+        help="Clipping des prédictions (défaut: 0.025)"
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default=DATA_DIR,
@@ -470,6 +571,7 @@ if __name__ == "__main__":
         submission_path = args.submission,
         start_season    = args.start_season,
         inter_season    = args.inter_season,
+        clip            = args.clip,
         data_dir        = args.data_dir,
     )
 

@@ -185,7 +185,7 @@ def compute_brier_score(submission, ground_truth):
 # 4. ANALYSE DÉTAILLÉE
 # ─────────────────────────────────────────────
 
-def analyze_results(details_df):
+def analyze_results(details_df, calibration, goodbads):
     """Affiche une analyse complète des prédictions."""
 
     brier_score = np.mean(details_df['brier'])
@@ -218,31 +218,33 @@ def analyze_results(details_df):
     print(f"    Erreur max         : {details_df['brier'].max():.4f}")
     print(f"    Erreur min         : {details_df['brier'].min():.4f}")
 
-    # # Pires prédictions
-    # print(f"\n  🔴 Les 5 pires prédictions :")
-    # worst = details_df.nlargest(5, "brier")[["Season","ID","y_pred","y_true","brier"]]
-    # worst["y_true"] = worst["y_true"].map({1: "Team1 a gagné", 0: "Team2 a gagné"})
-    # worst.columns   = ["Season","ID", "Proba prédite", "Résultat réel", "Erreur²"]
-    # print(worst.to_string(index=False))
+    if goodbads:
+        # Pires prédictions
+        print(f"\n  🔴 Les 5 pires prédictions :")
+        worst = details_df.nlargest(5, "brier")[["Season","ID","y_pred","y_true","brier"]]
+        worst["y_true"] = worst["y_true"].map({1: "Team1 a gagné", 0: "Team2 a gagné"})
+        worst.columns   = ["Season","ID", "Proba prédite", "Résultat réel", "Erreur²"]
+        print(worst.to_string(index=False))
+    
+        # Meilleures prédictions
+        print(f"\n  🟢 Les 5 meilleures prédictions :")
+        best = details_df.nsmallest(5, "brier")[["Season","ID","y_pred","y_true","brier"]]
+        best["y_true"] = best["y_true"].map({1: "Team1 a gagné", 0: "Team2 a gagné"})
+        best.columns   = ["Season","ID", "Proba prédite", "Résultat réel", "Erreur²"]
+        print(best.to_string(index=False))
 
-    # # Meilleures prédictions
-    # print(f"\n  🟢 Les 5 meilleures prédictions :")
-    # best = details_df.nsmallest(5, "brier")[["Season","ID","y_pred","y_true","brier"]]
-    # best["y_true"] = best["y_true"].map({1: "Team1 a gagné", 0: "Team2 a gagné"})
-    # best.columns   = ["Season","ID", "Proba prédite", "Résultat réel", "Erreur²"]
-    # print(best.to_string(index=False))
-
-    # Calibration : le modèle est-il bien calibré ?
-    print(f"\n  📐 Calibration (proba prédite vs taux de victoire réel) :")
-    bins = [0.0, 0.2, 0.35, 0.45, 0.55, 0.65, 0.80, 1.0]
-    details_df["bin"] = pd.cut(details_df["y_pred"], bins=bins)
-    calib = details_df.groupby("bin", observed=True).agg(
-        n          = ("y_true", "count"),
-        mean_pred  = ("y_pred", "mean"),
-        actual_win = ("y_true", "mean"),
-    ).reset_index()
-    calib["gap"] = (calib["mean_pred"] - calib["actual_win"]).abs()
-    print(calib[["bin","n","mean_pred","actual_win","gap"]].to_string(index=False))
+    if calibration:
+        # Calibration : le modèle est-il bien calibré ?
+        print(f"\n  📐 Calibration (proba prédite vs taux de victoire réel) :")
+        bins = [0.0, 0.2, 0.35, 0.45, 0.55, 0.65, 0.80, 1.0]
+        details_df["bin"] = pd.cut(details_df["y_pred"], bins=bins)
+        calib = details_df.groupby("bin", observed=True).agg(
+            n          = ("y_true", "count"),
+            mean_pred  = ("y_pred", "mean"),
+            actual_win = ("y_true", "mean"),
+        ).reset_index()
+        calib["gap"] = (calib["mean_pred"] - calib["actual_win"]).abs()
+        print(calib[["bin","n","mean_pred","actual_win","gap"]].to_string(index=False))
 
     return {
         "brier_score" : brier_score,
@@ -257,7 +259,7 @@ def analyze_results(details_df):
 # 5. PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
 
-def evaluate(submission_path, details, data_dir):
+def evaluate(submission_path, details, calibration, goodbads, data_dir):
     print("=" * 55)
     print("  Évaluation Brier Score stage 1 — Saisons 2022-2025")
     print("=" * 55)
@@ -274,9 +276,9 @@ def evaluate(submission_path, details, data_dir):
 
     for season in [2022, 2023, 2024, 2025]:
         df = details_df[details_df["Season"] == season].copy()   
-        _ = analyze_results(df)
+        _ = analyze_results(df, calibration, goodbads)
     
-    metrics = analyze_results(details_df)
+    metrics = analyze_results(details_df, calibration, goodbads)
 
     # Sauvegarde optionnelle du détail match par match
     if details:
@@ -309,6 +311,16 @@ if __name__ == "__main__":
         help="Crée un fichier de résultats détaillés"
     )
     parser.add_argument(
+        "--calibration",
+        action="store_true",
+        help="Affiche les détails de la calibration"
+    )
+    parser.add_argument(
+        "--goodbads",
+        action="store_true",
+        help="Affiche les pires et les meilleures prédictions"
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default=DATA_DIR,
@@ -320,5 +332,7 @@ if __name__ == "__main__":
     metrics, details = evaluate(
         submission_path = args.submission,
         details         = args.details,
+        calibration     = args.calibration,
+        goodbads        = args.goodbads,
         data_dir        = args.data_dir
     )

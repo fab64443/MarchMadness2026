@@ -21,6 +21,7 @@ Sources de données utilisées :
 
 import os
 import argparse
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -38,8 +39,6 @@ DATA_DIR       = "/home/fabrice/notebooks/kaggle/marchmadness/input"
 # Hyperparamètres ELO
 ELO_INITIAL    = 1500   # Rating de départ pour toute équipe
 ELO_K          = 20     # Sensibilité aux résultats récents
-ELO_MOV        = True   # Utiliser la marge de victoire (Margin of Victory)
-
 
 # +
 # ─────────────────────────────────────────────
@@ -72,20 +71,35 @@ def expected_score(ra, rb):
     return 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
 
 
-def k_factor(margin, k_base=ELO_K, use_mov=ELO_MOV):
+def k_factor(margin, k_base=ELO_K):
     """
     Facteur K ajusté selon la marge de victoire.
     Une victoire de 30 pts doit peser plus qu'une victoire de 1 pt.
     Formule inspirée de FiveThirtyEight NBA Elo.
     """
-    if not use_mov:
-        return k_base
     # Racine carrée de la marge, plafonnée pour éviter les valeurs extrêmes
     mov_multiplier = np.sqrt(min(margin, 40)) / np.sqrt(10)
     return k_base * mov_multiplier
 
 
-def compute_elo(results_df, initial=ELO_INITIAL):
+def k_factor_advanced(margin, elo_diff, k_base=ELO_K):
+    """
+    K-factor qui tient compte :
+    - de la marge de victoire (déjà fait)
+    - de l'écart ELO avant le match
+    
+    L'idée : battre un adversaire bien classé avec 20 pts d'écart
+    est plus significatif que battre un faible avec le même écart.
+    Formule FiveThirtyEight NFL adaptée au basket.
+    """
+    mov_mult  = np.log(max(margin, 1) + 1)
+    # Correction : une grosse victoire contre un faible
+    # est moins méritoire qu'une grosse victoire contre un fort
+    elo_corr  = 2.2 / (abs(elo_diff) * 0.001 + 2.2)
+    return k_base * mov_mult * elo_corr
+    
+    
+def compute_elo(results_df, inter_season, initial=ELO_INITIAL):
     """
     Calcule les ratings ELO pour chaque équipe et chaque saison.
 
@@ -122,7 +136,8 @@ def compute_elo(results_df, initial=ELO_INITIAL):
                 # Régression vers 1500 (30%) pour la nouvelle saison
                 regressed = {}
                 for team, rating in elo_current.items():
-                    regressed[team] = rating * 0.70 + initial * 0.30
+                    regressed[team] = rating * (1-inter_season) + initial * inter_season
+                    # regressed[team] = rating * 0.70 + initial * 0.30
                 elo_current = regressed
 
             current_season = s
@@ -136,7 +151,8 @@ def compute_elo(results_df, initial=ELO_INITIAL):
 
         # Facteur K ajusté sur la marge
         margin = row["WScore"] - row["LScore"]
-        k = k_factor(margin)
+        # k = k_factor(margin)
+        k = k_factor_advanced(margin, elo_w-elo_l)
 
         # Mise à jour
         elo_current[w] = elo_w + k * (1.0 - exp_w)
@@ -150,23 +166,21 @@ def compute_elo(results_df, initial=ELO_INITIAL):
     return elo_history
 
 
-def build_combined_elo(m_reg, w_reg):
+def build_combined_elo(m_reg, w_reg, inter_season):
     """
     Calcule l'ELO séparément pour les hommes et les femmes,
     puis fusionne dans un seul dictionnaire.
     Les TeamIDs hommes et femmes ne se chevauchent pas (garanti par Kaggle).
     """
     print("  Calcul ELO hommes...")
-    elo_men   = compute_elo(m_reg)
+    elo_men   = compute_elo(m_reg, inter_season)
     print(f"  → {len(elo_men):,} entrées (Season, TeamID)")
 
     print("  Calcul ELO femmes...")
-    elo_women = compute_elo(w_reg)
+    elo_women = compute_elo(w_reg, inter_season)
     print(f"  → {len(elo_women):,} entrées (Season, TeamID)")
 
     return {**elo_men, **elo_women}
-
-
 
 # +
 # ─────────────────────────────────────────────
@@ -276,7 +290,6 @@ def analyze_predictions(model, train_df):
         print(f"  {diff:>+8}      {p:.3f}          {label}")
 
 
-
 # +
 # ─────────────────────────────────────────────
 # 6. GÉNÉRATION DE LA SOUMISSION
@@ -297,8 +310,8 @@ def generate_submission(sample_all, elo_dict, model, output_path):
     # sample_sub = sample_all[sample_all["ID"].str.startswith(f"{current_season}_")]
     # Prédictions pour les saisons 2022-2025
     sample_sub = sample_all
-    
-    for i, row in sample_sub.iterrows():
+
+    for _, row in tqdm(sample_sub.iterrows(), total=len(sample_sub), mininterval=2, dynamic_ncols=True):        
         parts = row["ID"].split("_")
         s  = int(parts[0])
         t1 = int(parts[1])   # garanti t1 < t2 par Kaggle
@@ -319,8 +332,6 @@ def generate_submission(sample_all, elo_dict, model, output_path):
             n_neutral += 1
 
         preds.append(p)
-        if (i % 50000):
-            print("")
 
     result = sample_sub.copy()
     result["Pred"] = preds
@@ -339,7 +350,7 @@ def generate_submission(sample_all, elo_dict, model, output_path):
 # 7. PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
 
-def evaluate(submission_path, start_season, data_dir):
+def evaluate(submission_path, start_season, inter_season, data_dir):
     print("=" * 55)
     print("  March Mania 2026 — Modèle ELO Only")
     print("=" * 55)
@@ -352,7 +363,7 @@ def evaluate(submission_path, start_season, data_dir):
     print("\n[2/4] Calcul des ratings ELO...")
     # On calcule l'ELO sur la saison régulière uniquement
     # (le tournoi ne doit PAS alimenter l'ELO pour éviter le data leakage)
-    elo_dict = build_combined_elo(m_reg, w_reg)
+    elo_dict = build_combined_elo(m_reg, w_reg, inter_season)
 
     # ── Entraînement ────────────────────────────
     print("\n[3/4] Entraînement du modèle...")
@@ -395,12 +406,33 @@ def evaluate(submission_path, start_season, data_dir):
     print("   - Hommes et femmes traités séparément puis fusionnés")
     print("   - Sélectionner manuellement vos 2 meilleures soumissions !")
 
-    
     return model, sub, metrics
 
- 
+
 # ─────────────────────────────────────────────
-# 6. POINT D'ENTRÉE — LIGNE DE COMMANDE
+# 8. UTILITAIRES
+# ─────────────────────────────────────────────
+
+def float_range(min_value: float, max_value: float):
+    def validator(value):
+        try:
+            value = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{value} n'est pas un float valide"
+            )
+
+        if not (min_value <= value <= max_value):
+            raise argparse.ArgumentTypeError(
+                f"{value} doit être compris entre {min_value} et {max_value}"
+            )
+
+        return value
+
+    return validator
+    
+# ─────────────────────────────────────────────
+# 9. POINT D'ENTRÉE — LIGNE DE COMMANDE
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -420,6 +452,12 @@ if __name__ == "__main__":
         help="Année de départ pour calculer les statistiques (défaut: 2003)"
     )
     parser.add_argument(
+        "--inter_season",
+        type=float_range(0.0, 1.0),
+        default=0.3,
+        help="Regression inter-saison (défaut: 0.3)"
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default=DATA_DIR,
@@ -431,11 +469,8 @@ if __name__ == "__main__":
     model, subs, metrics = evaluate(
         submission_path = args.submission,
         start_season    = args.start_season,
+        inter_season    = args.inter_season,
         data_dir        = args.data_dir,
     )
-
-
-
-
 
 

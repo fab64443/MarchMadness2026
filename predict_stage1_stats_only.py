@@ -188,47 +188,6 @@ def train_model(train_df):
 # 5. GÉNÉRATION SOUMISSION
 # ─────────────────────────────────────────────
 
-def generate_submission_OLD(sample_all, team_stats, model, submission_path, clip):
-
-    rows = []
-
-    for _, row in tqdm(sample_all.iterrows(), total=len(sample_all), mininterval=2, dynamic_ncols=True):        
-
-        parts = row.ID.split("_")
-        season = int(parts[0])
-        team1  = int(parts[1])   # garanti t1 < t2 par Kaggle
-        team2  = int(parts[2])        
-        
-        stats1 = team_stats[
-            (team_stats.Season == season) &
-            (team_stats.TeamID == team1)
-        ]
-
-        stats2 = team_stats[
-            (team_stats.Season == season) &
-            (team_stats.TeamID == team2)
-        ]
-
-        if len(stats1)==0 or len(stats2)==0:
-            pred = 0.5
-        else:
-            diff = stats1.iloc[0][["win_pct","point_diff","points_for","points_against"]] \
-                 - stats2.iloc[0][["win_pct","point_diff","points_for","points_against"]]
-
-            pred = model.predict_proba([diff.values])[0][1]
-
-        pred = np.clip(pred, clip, 1-clip)
-        rows.append(pred)
-
-    # sub = sample_all.copy()
-    sample_all["Pred"] = rows
-    sample_all.to_csv(submission_path, index=False)
-
-    print(f"Soumission sauvegardée : {submission_path}")
-
-    return sample_all
-
-
 def generate_submission(sample_all, team_stats, model, submission_path, clip):
 
     df = sample_all.copy()

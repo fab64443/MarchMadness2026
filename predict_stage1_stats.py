@@ -122,7 +122,7 @@ def build_team_infos(reg_df, start_season):
 # 3a. STATS ÉQUIPE SAISON
 # ─────────────────────────────────────────────
 
-def build_team_stats_global(teams):
+def build_team_stats(teams):
 
     stats = teams.groupby(["Season", "TeamID"], as_index=False).mean(numeric_only=True)
     
@@ -142,66 +142,16 @@ def build_team_stats_global(teams):
 # 3b. STATS ÉQUIPE SAISON
 # ─────────────────────────────────────────────
 
-def build_team_stats_cumul(teams):
-    # toutes les saisons de chaque équipe
-    season_team = teams.groupby(["Season", "TeamID"], as_index=False).size()[["Season", "TeamID"]]
-    # répéter 3 fois
-    virt1 = season_team.loc[season_team.index.repeat(3)].copy()     
-    # ajouter les stats des macthes virtuels
-    virt_stats = { "DayNum": -1, "ScoreOff": 70, "ScoreDef": 70, "Loc" : "N", "NumOT": 0, "FGM": 25, "FGA": 58, "FGM3": 7, "FGA3": 22, 
-                   "FTM": 13, "FTA": 18, "ORd": 10, "DRd": 25, "Ast": 14, "TOr": 13, "Stl": 6, "Blk": 4, "PF": 17, "Win": 0 }
-    for k, v in virt_stats.items():
-        virt1[k] = v
 
-    # ajouter un match final
-    virt2 = season_team.loc[season_team.index.repeat(1)].copy()     
-    # ajouter les stats des macthes virtuels
-    virt_stats = { "DayNum": 999, "ScoreOff": 70, "ScoreDef": 70, "Loc" : "N", "NumOT": 0, "FGM": 25, "FGA": 58, "FGM3": 7, "FGA3": 22, 
-                   "FTM": 13, "FTA": 18, "ORd": 10, "DRd": 25, "Ast": 14, "TOr": 13, "Stl": 6, "Blk": 4, "PF": 17, "Win": 0 }
-    for k, v in virt_stats.items():
-        virt2[k] = v
-    
-    virt = pd.concat([virt1, virt2], ignore_index=True)
-    # advanced statistics
-    virt = compute_adv_statistics(virt)
 
-    # concatenate virtals macthes with regular matches
-    games = pd.concat([teams, virt], ignore_index=True)
-    
-    games = games.sort_values(["Season", "TeamID", "DayNum"])
-    stats_cols = [
-        'ScoreOff', 'ScoreDef', 'NumOT', 'FGM', 'FGA', 'FGM3', 'FGA3', 'FTM', 'FTA',
-        'ORd', 'DRd', 'Ast', 'TOr', 'Stl', 'Blk', 'PF', 'Win', 'Margin', 'Poss',
-        'OffRate', 'DefRate', 'NetRate', 'eFGPct', 'TSPct', 'FGA3Rate', 'FTRate',
-        'TOVRate', 'ORPct', 'DRPct'
-    ]
-
-    print('   Calcul de la moyenne pondérée')
-    games[stats_cols] = (
-        games
-        .groupby(["Season","TeamID"])[stats_cols]
-        .transform(lambda x: x.ewm(alpha=0.2, adjust=False).mean().shift())
-    )
-
-    # print('   Calcul de la moyenne cumulée')
-    # games[stats_cols] = (
-    #     games
-    #     .groupby(["Season", "TeamID"])[stats_cols]
-    #     .transform(lambda x: x.expanding().mean().shift())
-    # )    
-
-    # remove virtual matches
-    final_games = games[games.DayNum == 999]
-    reg_games = games[(games.DayNum > -1) & (games.DayNum < 999)]
-    return reg_games, final_games
 
 # ─────────────────────────────────────────────
 # 4. TRAINING DATASET
 # ─────────────────────────────────────────────
 
-def build_training_set(tourney_df, team_stats):
+def build_training_set(tourney, team_stats):
 
-    df = tourney_df[["Season", "DayNum", "WTeamID", "LTeamID"]].copy()
+    df = tourney[["Season", "WTeamID", "LTeamID"]].copy()
 
     # TeamLow / TeamHigh
     df["TeamLow"]  = df[["WTeamID", "LTeamID"]].min(axis=1)
@@ -216,17 +166,16 @@ def build_training_set(tourney_df, team_stats):
     df = pd.concat([df, dfr], ignore_index=True).drop(columns=["WTeamID","LTeamID"])
 
     # Index stats
-    team_stats = team_stats.drop(columns=["Loc"])
-    stats = team_stats.set_index(["Season","TeamID","DayNum"])
+    stats = team_stats.set_index(["Season","TeamID"])
 
-    stat_cols = [c for c in team_stats.columns if c not in ["Season","TeamID","DayNum"]]
+    stat_cols = [c for c in team_stats.columns if c not in ["Season","TeamID"]]
 
     # Join TeamLow
     low_stats = stats.rename(columns={c: f"{c}_low" for c in stat_cols})
 
     df = df.join(
         low_stats,
-        on=["Season","TeamLow","DayNum"]
+        on=["Season","TeamLow"]
     )
 
     # Join TeamHigh
@@ -234,7 +183,7 @@ def build_training_set(tourney_df, team_stats):
 
     df = df.join(
         high_stats,
-        on=["Season","TeamHigh","DayNum"]
+        on=["Season","TeamHigh"]
     )
 
     # Diff features
@@ -243,25 +192,29 @@ def build_training_set(tourney_df, team_stats):
         
     df = df.drop(columns=[c for c in df.columns if c.endswith("_low") or c.endswith("_high")])
 
-    # enlever les premiers matches de chaque équipe dans chaque saison parce diff = 0
-    df = df[~((df.NetRate_diff==0) & (df.OffRate_diff==0) & (df.DefRate_diff==0) & (df.Poss_diff==0))]    
-    
-    features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "Win_diff", "Margin_diff", "NetRate_diff", 
+    features = ["Season", "TeamLow", "TeamHigh", "target", "Win_diff", "Margin_diff", "NetRate_diff", 
                 "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
-                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]
+                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff", "WinPct_diff"]
 
-    # features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "NetRate_diff", "OffRate_diff", "DefRate_diff",
-    #             "Poss_diff", "Margin_diff", "eFGPct_diff", "TOVRate_diff", "ORPct_diff", "FTRate_diff", "FGA3Rate_diff",
-    #             "TSPct_diff" ]
-
-    # features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "NetRate_diff" ]
-    
     df = df[features]
     return df
 
 # ─────────────────────────────────────────────
 # 5. ENTRAÎNEMENT
 # ─────────────────────────────────────────────
+
+def logit(train):
+
+    X = train[["NetRate_diff"]]
+    y = train["target"]
+
+    model = LogisticRegression()
+    model.fit(X, y)
+
+    preds = model.predict_proba(X)[:,1]
+    print("LogLoss train:", log_loss(y, preds))
+
+    return model    
 
 def train_model(train_df):
     
@@ -327,7 +280,6 @@ def train_model(train_df):
     # print(importance)
 
     return model
-
     
 
 # ─────────────────────────────────────────────
@@ -337,7 +289,7 @@ def train_model(train_df):
 def build_testing_set(sample, team_stats):
    
     df = sample.copy()
-    team_stats = team_stats.drop(columns=["Loc","DayNum"])
+    team_stats = team_stats.drop(columns=["DayNum"])
 
     # 1. Split ID proprement (vectorisé)
     id_split = df["ID"].str.split("_", expand=True)
@@ -349,7 +301,7 @@ def build_testing_set(sample, team_stats):
     # Index stats
     stats = team_stats.set_index(["Season","TeamID"])
 
-    stat_cols = [c for c in team_stats.columns if c not in ["Season","TeamID","DayNum"]]
+    stat_cols = [c for c in team_stats.columns if c not in ["Season","TeamID"]]
     
     # Join TeamLow
     low_stats = stats.rename(columns={c: f"{c}_low" for c in stat_cols})
@@ -358,7 +310,6 @@ def build_testing_set(sample, team_stats):
         low_stats,
         on=["Season","TeamLow"]
     )
-
 
     # Join TeamHigh
     high_stats = stats.rename(columns={c: f"{c}_high" for c in stat_cols})
@@ -376,14 +327,8 @@ def build_testing_set(sample, team_stats):
     
     features = ["Season", "TeamLow", "TeamHigh", "Win_diff", "Margin_diff", "NetRate_diff", 
                 "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
-                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]
+                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff", "WinPct_diff"]
 
-    # features = ["Season", "TeamLow", "TeamHigh", "NetRate_diff", "OffRate_diff", "DefRate_diff",
-    #             "Poss_diff", "Margin_diff", "eFGPct_diff", "TOVRate_diff", "ORPct_diff", "FTRate_diff", "FGA3Rate_diff",
-    #             "TSPct_diff" ]
-
-    # features = ["Season", "TeamLow", "TeamHigh",  "NetRate_diff" ]
-    
     df = df[features]
 
     return df
@@ -442,13 +387,11 @@ def evaluate(args):
     print(f"teams - lignes: {teams.shape[0]:>7,} colonnes: {list(teams.columns)}")   
     
     print("\n[3/7] Construction des stats équipes")
-    # team_stats_global = build_team_stats_global(teams)
-    reg_stats, final_stats = build_team_stats_cumul(teams)
+    reg_stats = build_team_stats(teams)
     print(f"stats - lignes: {reg_stats.shape[0]:>7,}")   
-    print(f"stats - lignes: {final_stats.shape[0]:>7,}")   
 
     print("\n[4/7] Construction dataset train")
-    train = build_training_set(reg, reg_stats)
+    train = build_training_set(tourney, reg_stats)
     print(f"train - lignes: {train.shape[0]:>7,} colonnes: {list(train.columns)}")   
     print("Taille train:", len(train))
     
@@ -456,7 +399,7 @@ def evaluate(args):
     model = train_model(train)
 
     print("\n[6/7] Construction dataset test")
-    test = build_testing_set(sample_all, final_stats)
+    test = build_testing_set(sample_all, reg_stats)
     print(f"test - lignes: {test.shape[0]:>7,} colonnes: {list(test.columns)}")   
     print("Taille test:", len(test))
     
@@ -464,7 +407,6 @@ def evaluate(args):
     sub = generate_submission(test, model, args.submission, args.clip)
                                                      
     return model, sub
-
     
 # ─────────────────────────────────────────────
 # 8. UTILITAIRES

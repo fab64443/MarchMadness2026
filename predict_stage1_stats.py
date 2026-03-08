@@ -4,9 +4,9 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-# from sklearn.linear_model import LogisticRegression
-# from sklearn.model_selection import cross_val_score, StratifiedKFold
-# from sklearn.metrics import log_loss
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import log_loss, roc_auc_score, accuracy_score, brier_score_loss
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -183,6 +183,13 @@ def build_team_stats_cumul(teams):
         .transform(lambda x: x.ewm(alpha=0.2, adjust=False).mean().shift())
     )
 
+    # print('   Calcul de la moyenne cumulée')
+    # games[stats_cols] = (
+    #     games
+    #     .groupby(["Season", "TeamID"])[stats_cols]
+    #     .transform(lambda x: x.expanding().mean().shift())
+    # )    
+
     # remove virtual matches
     final_games = games[games.DayNum == 999]
     reg_games = games[(games.DayNum > -1) & (games.DayNum < 999)]
@@ -236,11 +243,20 @@ def build_training_set(tourney_df, team_stats):
         
     df = df.drop(columns=[c for c in df.columns if c.endswith("_low") or c.endswith("_high")])
 
-    # features importantes
-    df = df[["Season", "DayNum", "TeamLow", "TeamHigh", "target", "Win_diff", "Margin_diff", "NetRate_diff", 
-            "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
-            "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]]
+    # enlever les premiers matches de chaque équipe dans chaque saison parce diff = 0
+    df = df[~((df.NetRate_diff==0) & (df.OffRate_diff==0) & (df.DefRate_diff==0) & (df.Poss_diff==0))]    
     
+    features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "Win_diff", "Margin_diff", "NetRate_diff", 
+                "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
+                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]
+
+    # features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "NetRate_diff", "OffRate_diff", "DefRate_diff",
+    #             "Poss_diff", "Margin_diff", "eFGPct_diff", "TOVRate_diff", "ORPct_diff", "FTRate_diff", "FGA3Rate_diff",
+    #             "TSPct_diff" ]
+
+    # features = ["Season", "DayNum", "TeamLow", "TeamHigh", "target", "NetRate_diff" ]
+    
+    df = df[features]
     return df
 
 # ─────────────────────────────────────────────
@@ -248,19 +264,24 @@ def build_training_set(tourney_df, team_stats):
 # ─────────────────────────────────────────────
 
 def train_model(train_df):
+    
     # features
-    # train_df["abs_net_diff"] = train_df["NetRate_diff"].abs()
     features = [c for c in train_df.columns if c.endswith("_diff")]
     
     X = train_df[features]
     y = train_df["target"]
 
-    train_data = lgb.Dataset(X, label=y)
-    
-    # LightGBM parameters
+    # split validation
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    train_data = lgb.Dataset(X_train, label=y_train)
+    valid_data = lgb.Dataset(X_valid, label=y_valid)
+
     params = {
         "objective": "binary",
-        "metric": "binary_logloss",
+        "metric": ["binary_logloss", "auc"],
         "learning_rate": 0.02,
         "num_leaves": 64,
         "feature_fraction": 0.8,
@@ -268,21 +289,45 @@ def train_model(train_df):
         "bagging_freq": 5,
         "verbosity": -1
     }
-    
+
     model = lgb.train(
         params,
         train_data,
-        num_boost_round=2000
-    )
-        
-    importance = pd.DataFrame({
-        "feature": features,
-        "importance": model.feature_importance()
-    }).sort_values("importance", ascending=False)
-    
-    print(importance)
+        num_boost_round=2000,
+        valid_sets=[train_data, valid_data],
+        valid_names=["train", "valid"],
+        callbacks=[
+            lgb.early_stopping(100),
+            lgb.log_evaluation(100)
+        ]
+    )    
+
+    # prédictions
+    y_pred = model.predict(X_valid)
+
+    # métriques
+    metrics = {
+        "logloss": log_loss(y_valid, y_pred),
+        "auc": roc_auc_score(y_valid, y_pred),
+        "accuracy": accuracy_score(y_valid, (y_pred > 0.5).astype(int)),
+        "brier": brier_score_loss(y_valid, y_pred)
+    }
+
+    print("\nValidation metrics")
+    for k, v in metrics.items():
+        print(f"{k}: {v:.5f}")
+
+    # # importance
+    # importance = pd.DataFrame({
+    #     "feature": features,
+    #     "importance": model.feature_importance()
+    # }).sort_values("importance", ascending=False)
+
+    # print("\nFeature importance")
+    # print(importance)
 
     return model
+
     
 
 # ─────────────────────────────────────────────
@@ -329,10 +374,17 @@ def build_testing_set(sample, team_stats):
 
     df = df.drop(columns=[c for c in df.columns if c.endswith("_low") or c.endswith("_high")])
     
-    # features importantes
-    df = df[["Season", "TeamLow", "TeamHigh", "Win_diff", "Margin_diff", "NetRate_diff", 
-            "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
-            "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]]
+    features = ["Season", "TeamLow", "TeamHigh", "Win_diff", "Margin_diff", "NetRate_diff", 
+                "OffRate_diff", "DefRate_diff", "Poss_diff", "eFGPct_diff", "TSPct_diff", "FGA3Rate_diff", "FTRate_diff",
+                "TOVRate_diff", "ORPct_diff", "DRPct_diff", "Ast_diff", "Stl_diff", "Blk_diff", "PF_diff"]
+
+    # features = ["Season", "TeamLow", "TeamHigh", "NetRate_diff", "OffRate_diff", "DefRate_diff",
+    #             "Poss_diff", "Margin_diff", "eFGPct_diff", "TOVRate_diff", "ORPct_diff", "FTRate_diff", "FGA3Rate_diff",
+    #             "TSPct_diff" ]
+
+    # features = ["Season", "TeamLow", "TeamHigh",  "NetRate_diff" ]
+    
+    df = df[features]
 
     return df
 

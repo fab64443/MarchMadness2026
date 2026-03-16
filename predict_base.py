@@ -28,11 +28,28 @@ WORK_DIR       = "/home/fabrice/notebooks/kaggle/marchmadness/work/"
 # LOAD PRECOMPUTED TEAMS DATA 
 # ─────────────────────────────────────────────
 def load_team_elo():
+    # brier 2025 : 0.104718
     elo = pd.read_csv(WORK_DIR + "elo_ratings_2003_2026.csv")
     elo = elo[["Season","TeamID","elo_last","elo_vs_peak"]]
     print(f"elo shape : {elo.shape}, {list(elo.columns)}")
     return elo
 
+def load_team_stats():
+    # brier 2025 : 0.116735
+    stats = pd.read_csv(WORK_DIR + "team_stats_2003-2026.csv")
+    stats = stats[["Season","TeamID","Win","Margin","NetRate","OffRate","DefRate","Poss","eFGPct","TSPct",
+                   "FGA3Rate","FTRate","TOVRate","ORPct","DRPct","Ast","Stl","Blk","PF","WinPct" ]]
+    print(f"stats shape : {stats.shape}, {list(stats.columns)}")
+    return stats
+
+def load_team_advelo():
+    # brier 2025 : 0.038587
+    elo = pd.read_csv(WORK_DIR + "elo_ratings_2003_2026.csv")
+    elo = elo[["Season","TeamID","elo_last","elo_vs_peak","elo_late_trend",
+               "strength_of_schedule","quality_of_wins"]]
+    print(f"elo shape : {elo.shape}, {list(elo.columns)}")
+    return elo
+    
 # ─────────────────────────────────────────────
 # LOAD TOURNEY MATCHES 
 # ─────────────────────────────────────────────
@@ -150,14 +167,14 @@ def train_model(train_df):
     for k, v in metrics.items():
         print(f"{k}: {v:.5f}")
 
-    # # importance
-    # importance = pd.DataFrame({
-    #     "feature": features,
-    #     "importance": model.feature_importance()
-    # }).sort_values("importance", ascending=False)
+    # importance
+    importance = pd.DataFrame({
+        "feature": features,
+        "importance": model.feature_importance()
+    }).sort_values("importance", ascending=False)
 
-    # print("\nFeature importance")
-    # print(importance)
+    print("\nFeature importance")
+    print(importance)
 
     return model
 
@@ -254,8 +271,12 @@ print("="*60)
 print("March Mania 2026 — Models")
 print("="*60)
 
-print("\n[01] Loading teams elo")
-team_stats = load_team_elo()
+# print("\n[01.1] Loading teams elo")
+# team_stats = load_team_elo()
+# print("\n[01.2] Loading teams stats")
+# team_stats = load_team_stats()
+print("\n[01.3] Loading teams advelo")
+team_stats = load_team_advelo()
 
 print("\n[02] Loading tourneys")
 tourney = load_tourney()

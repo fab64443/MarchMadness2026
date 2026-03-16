@@ -99,77 +99,11 @@ def k_factor_advanced(margin, elo_diff, k_base=ELO_K):
     return k_base * mov_mult * elo_corr
     
     
-def compute_elo_OLD(results_df, inter_season, initial=ELO_INITIAL):
-    """
-    Calcule les ratings ELO pour chaque équipe et chaque saison.
-
-    Stratégie de réinitialisation inter-saisons :
-      - On ne repart pas de zéro chaque saison
-      - On régresse vers la moyenne (1500) de 30%
-        pour tenir compte du renouvellement des effectifs
-
-    Retourne un dict {(Season, TeamID): elo_final}
-    """
-    elo_current = {}   # ELO courant (mis à jour match par match)
-    elo_history = {}   # ELO final enregistré à la fin de chaque saison
-
-    def get_elo(team):
-        return elo_current.get(team, initial)
-
-    current_season = None
-
-    # Tri chronologique strict
-    df = results_df.sort_values(["Season", "DayNum"]).reset_index(drop=True)
-
-    for _, row in df.iterrows():
-        s = row["Season"]
-        w = row["WTeamID"]
-        l = row["LTeamID"]
-
-        # Détection du changement de saison → régression vers la moyenne
-        if s != current_season:
-            if current_season is not None:
-                # Sauvegarde des ELO de fin de saison précédente
-                for team, rating in elo_current.items():
-                    elo_history[(current_season, team)] = rating
-
-                # Régression vers 1500 (30%) pour la nouvelle saison
-                regressed = {}
-                for team, rating in elo_current.items():
-                    regressed[team] = rating * (1-inter_season) + initial * inter_season
-                    # regressed[team] = rating * 0.70 + initial * 0.30
-                elo_current = regressed
-
-            current_season = s
-
-        # Ratings avant le match
-        elo_w = get_elo(w)
-        elo_l = get_elo(l)
-
-        # Probabilité attendue
-        exp_w = expected_score(elo_w, elo_l)
-
-        # Facteur K ajusté sur la marge
-        margin = row["WScore"] - row["LScore"]
-        # k = k_factor(margin)
-        k = k_factor_advanced(margin, elo_w-elo_l)
-
-        # Mise à jour
-        elo_current[w] = elo_w + k * (1.0 - exp_w)
-        elo_current[l] = elo_l + k * (0.0 - (1.0 - exp_w))
-
-    # Sauvegarde de la dernière saison
-    if current_season is not None:
-        for team, rating in elo_current.items():
-            elo_history[(current_season, team)] = rating
-
-    return elo_history
-
-
 def compute_elo(results_df, inter_season, initial=1500):
 
     elo_current = {}
     elo_history = {}
+    elo_peak    = {}
 
     current_season = None
 
@@ -181,9 +115,7 @@ def compute_elo(results_df, inter_season, initial=1500):
         w = row.WTeamID
         l = row.LTeamID
 
-        # ─────────────────────────────
         # Changement de saison
-        # ─────────────────────────────
         if s != current_season:
 
             if current_season is not None:
@@ -202,15 +134,11 @@ def compute_elo(results_df, inter_season, initial=1500):
 
             current_season = s
 
-        # ─────────────────────────────
         # Récupération ELO
-        # ─────────────────────────────
         elo_w = elo_current.get(w, initial)
         elo_l = elo_current.get(l, initial)
 
-        # ─────────────────────────────
         # Update
-        # ─────────────────────────────
         exp_w = 1.0 / (1.0 + 10 ** ((elo_l - elo_w) / 400))
 
         margin = row.WScore - row.LScore
@@ -219,16 +147,27 @@ def compute_elo(results_df, inter_season, initial=1500):
         elo_current[w] = elo_w + k * (1.0 - exp_w)
         elo_current[l] = elo_l - k * (1.0 - exp_w)
 
-    # ─────────────────────────────
+        # peak
+        if (current_season, l) not in elo_peak:
+            elo_peak[(current_season, l)] = elo_current[l]
+            
+        if (current_season, w) in elo_peak:
+            if elo_peak[(current_season, w)] > elo_current[w]:
+                elo_peak[(current_season, w)] = elo_current[w]
+        else:
+            elo_peak[(current_season, w)] = elo_current[w]
+
+    
     # Dernière saison
-    # ─────────────────────────────
     if current_season is not None:
         elo_history.update({
             (current_season, team): rating
             for team, rating in elo_current.items()
         })
 
-    return elo_history
+    
+    # return elo_history
+    return elo_history, elo_peak
 
     
 def build_combined_elo(m_reg, w_reg, inter_season):
@@ -238,11 +177,11 @@ def build_combined_elo(m_reg, w_reg, inter_season):
     Les TeamIDs hommes et femmes ne se chevauchent pas (garanti par Kaggle).
     """
     print("  Calcul ELO hommes...")
-    elo_men   = compute_elo(m_reg, inter_season)
+    elo_men, elo_m_peak   = compute_elo(m_reg, inter_season)
     print(f"  → {len(elo_men):,} entrées (Season, TeamID)")
 
     print("  Calcul ELO femmes...")
-    elo_women = compute_elo(w_reg, inter_season)
+    elo_women, elo_w_peak = compute_elo(w_reg, inter_season)
     print(f"  → {len(elo_women):,} entrées (Season, TeamID)")
 
     return {**elo_men, **elo_women}
@@ -444,8 +383,6 @@ def generate_submission(sample_all, elo_dict, model, output_path, clip):
     print(f"     → Neutres (ELO manq.)  : {n_neutral:,}")
 
     return result
-
-    
 
 # ─────────────────────────────────────────────
 # 7. PIPELINE PRINCIPAL

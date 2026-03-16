@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ─────────────────────────────────────────────
 DATA_DIR       = "/home/fabrice/notebooks/kaggle/marchmadness/input"
+WORK_DIR       = "/home/fabrice/notebooks/kaggle/marchmadness/work/"
 
 # ─────────────────────────────────────────────
 # 1. CHARGEMENT
@@ -138,12 +139,6 @@ def build_team_stats(teams):
     
     return stats
 
-# ─────────────────────────────────────────────
-# 3b. STATS ÉQUIPE SAISON
-# ─────────────────────────────────────────────
-
-
-
 
 # ─────────────────────────────────────────────
 # 4. TRAINING DATASET
@@ -202,19 +197,6 @@ def build_training_set(tourney, team_stats):
 # ─────────────────────────────────────────────
 # 5. ENTRAÎNEMENT
 # ─────────────────────────────────────────────
-
-def logit(train):
-
-    X = train[["NetRate_diff"]]
-    y = train["target"]
-
-    model = LogisticRegression()
-    model.fit(X, y)
-
-    preds = model.predict_proba(X)[:,1]
-    print("LogLoss train:", log_loss(y, preds))
-
-    return model    
 
 def train_model(train_df):
     
@@ -388,7 +370,11 @@ def evaluate(args):
     
     print("\n[3/7] Construction des stats équipes")
     reg_stats = build_team_stats(teams)
-    print(f"stats - lignes: {reg_stats.shape[0]:>7,}")   
+    print(f"stats - lignes: {reg_stats.shape[0]:>7,}")
+
+    print(f"Sauvegarde des stats par équipe")
+    reg_stats.to_csv(WORK_DIR+'team_stats_2003-2026.csv', index=False)
+    return {},{}
 
     print("\n[4/7] Construction dataset train")
     train = build_training_set(tourney, reg_stats)

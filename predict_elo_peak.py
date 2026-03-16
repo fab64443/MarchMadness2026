@@ -5,6 +5,7 @@ DATA_DIR       = "/home/fabrice/notebooks/kaggle/marchmadness/input"
 # Load this dataset
 elo_m = pd.read_csv(DATA_DIR + "/ncaa_elo_mens_2003_2026.csv")
 elo_w = pd.read_csv(DATA_DIR + "/ncaa_elo_womens_2003_2026.csv")
+elo = pd.concat([elo_m, elo_w], ignore_index=True)
 
 # Load competition sample submission
 sample = pd.read_csv(DATA_DIR + "/SampleSubmissionStage1.csv")
@@ -16,14 +17,14 @@ sample[["Season", "Team1", "Team2"]] = (
 
 # Join Elo features for Team 1
 sample = sample.merge(
-    elo_m[["Season","TeamID","FinalElo","EloVsPeakDiff"]].rename(
+    elo[["Season","TeamID","FinalElo","EloVsPeakDiff"]].rename(
         columns={"TeamID":"Team1","FinalElo":"Elo1","EloVsPeakDiff":"PeakDiff1"}
     ), on=["Season","Team1"], how="left"
 )
 
 # Join Elo features for Team 2
 sample = sample.merge(
-    elo_m[["Season","TeamID","FinalElo","EloVsPeakDiff"]].rename(
+    elo[["Season","TeamID","FinalElo","EloVsPeakDiff"]].rename(
         columns={"TeamID":"Team2","FinalElo":"Elo2","EloVsPeakDiff":"PeakDiff2"}
     ), on=["Season","Team2"], how="left"
 )

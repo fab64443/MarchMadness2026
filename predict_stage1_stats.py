@@ -141,6 +141,44 @@ def build_team_stats(teams):
 
 
 # ─────────────────────────────────────────────
+# 3b. ROAD WARRIOR INDEX
+# ─────────────────────────────────────────────
+
+def compute_road_warrior_index(reg_results):
+
+    # Matches où le winner joue à domicile
+    home_games = reg_results[reg_results["WLoc"] == "H"]
+
+    home_rows = pd.DataFrame({
+        "Season": pd.concat([home_games["Season"], home_games["Season"]]),
+        "TeamID": pd.concat([home_games["WTeamID"], home_games["LTeamID"]]),
+        "loc": ["home"] * len(home_games) + ["away"] * len(home_games),
+        "win": [1] * len(home_games) + [0] * len(home_games)
+    })
+
+    # Matches où le winner joue à l'extérieur
+    away_games = reg_results[reg_results["WLoc"] == "A"]
+
+    away_rows = pd.DataFrame({
+        "Season": pd.concat([away_games["Season"], away_games["Season"]]),
+        "TeamID": pd.concat([away_games["WTeamID"], away_games["LTeamID"]]),
+        "loc": ["away"] * len(away_games) + ["home"] * len(away_games),
+        "win": [1] * len(away_games) + [0] * len(away_games)
+    })
+
+    df = pd.concat([home_rows, away_rows], ignore_index=True)
+
+    pivot = (
+        df.groupby(["Season", "TeamID", "loc"])["win"]
+        .mean()
+        .unstack(fill_value=0.5)
+    )
+
+    pivot["road_warrior"] = pivot.get("away", 0.5) - pivot.get("home", 0.5)
+
+    return pivot["road_warrior"].reset_index()	    
+
+# ─────────────────────────────────────────────
 # 4. TRAINING DATASET
 # ─────────────────────────────────────────────
 
@@ -364,6 +402,11 @@ def evaluate(args):
     tourney = pd.concat([m_tourney, w_tourney], ignore_index=True)
     del m_reg, w_reg, m_tourney, w_tourney
 
+    print("\nRoad warrior index")
+    roadwarrior = compute_road_warrior_index(reg)
+    roadwarrior.to_csv(WORK_DIR + 'road_warrior_2003_2026.csv', index=False)
+    return {},{}
+    
     print("\n[2/7] Construction des infos équipes")
     teams = build_team_infos(reg, args.start_season)
     print(f"teams - lignes: {teams.shape[0]:>7,} colonnes: {list(teams.columns)}")   
@@ -371,10 +414,8 @@ def evaluate(args):
     print("\n[3/7] Construction des stats équipes")
     reg_stats = build_team_stats(teams)
     print(f"stats - lignes: {reg_stats.shape[0]:>7,}")
-
     print(f"Sauvegarde des stats par équipe")
     reg_stats.to_csv(WORK_DIR+'team_stats_2003-2026.csv', index=False)
-    return {},{}
 
     print("\n[4/7] Construction dataset train")
     train = build_training_set(tourney, reg_stats)

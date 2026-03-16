@@ -10,6 +10,8 @@ import lightgbm as lgb
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import log_loss, roc_auc_score, accuracy_score, brier_score_loss
+from sklearn.model_selection import StratifiedKFold
+
 import warnings
 
 # ─────────────────────────────────────────────
@@ -119,73 +121,110 @@ def build_training_set(tourney, team_stats):
     df = df[features]
     return df
 
+
 # ─────────────────────────────────────────────
-# TRAIN MODEL 
+# TRAIN MODEL WITH CROSS-VALIDATION
 # ─────────────────────────────────────────────
-def train_model(train_df):
-    
+def train_model_cv(train_df, n_splits=5):
+
     # features
     features = [c for c in train_df.columns if c.endswith("_diff")]
-    
+
     X = train_df[features]
     y = train_df["target"]
 
-    # split validation
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X, y, test_size=0.2, random_state=42
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    oof_preds = np.zeros(len(X))
+    models = []
+    fold_metrics = []
+
+    for fold, (train_idx, valid_idx) in enumerate(kf.split(X, y)):
+        print(f"\n{'='*40}")
+        print(f"FOLD {fold + 1} / {n_splits}")
+        print(f"{'='*40}")
+
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+
+        train_data = lgb.Dataset(X_train, label=y_train)
+        valid_data = lgb.Dataset(X_valid, label=y_valid)
+
+        params = {
+            "objective": "binary",
+            "metric": ["binary_logloss", "auc"],
+            "learning_rate": 0.02,
+            "num_leaves": 64,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+            "verbosity": -1
+        }
+
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=2000,
+            valid_sets=[train_data, valid_data],
+            valid_names=["train", "valid"],
+            callbacks=[
+                lgb.early_stopping(100),
+                lgb.log_evaluation(100)
+            ]
+        )
+
+        # prédictions OOF
+        fold_preds = model.predict(X_valid)
+        oof_preds[valid_idx] = fold_preds
+
+        # métriques par fold
+        metrics = {
+            "logloss": log_loss(y_valid, fold_preds),
+            "auc":     roc_auc_score(y_valid, fold_preds),
+            "accuracy": accuracy_score(y_valid, (fold_preds > 0.5).astype(int)),
+            "brier":   brier_score_loss(y_valid, fold_preds)
+        }
+        fold_metrics.append(metrics)
+
+        print(f"\nFold {fold + 1} metrics")
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.5f}")
+
+        models.append(model)
+
+    # ── métriques OOF globales ──────────────────
+    print(f"\n{'='*40}")
+    print("OOF METRICS (all folds)")
+    print(f"{'='*40}")
+
+    oof_metrics = {
+        "logloss":  log_loss(y, oof_preds),
+        "auc":      roc_auc_score(y, oof_preds),
+        "accuracy": accuracy_score(y, (oof_preds > 0.5).astype(int)),
+        "brier":    brier_score_loss(y, oof_preds)
+    }
+
+    fold_df = pd.DataFrame(fold_metrics)
+    for k in oof_metrics:
+        mean_v = fold_df[k].mean()
+        std_v  = fold_df[k].std()
+        oof_v  = oof_metrics[k]
+        print(f"  {k}: OOF={oof_v:.5f}  |  mean±std={mean_v:.5f}±{std_v:.5f}")
+
+    # ── importance moyenne ──────────────────────
+    mean_importance = np.mean(
+        [m.feature_importance() for m in models], axis=0
     )
-
-    train_data = lgb.Dataset(X_train, label=y_train)
-    valid_data = lgb.Dataset(X_valid, label=y_valid)
-
-    params = {
-        "objective": "binary",
-        "metric": ["binary_logloss", "auc"],
-        "learning_rate": 0.02,
-        "num_leaves": 64,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "verbosity": -1
-    }
-
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=2000,
-        valid_sets=[train_data, valid_data],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(100),
-            lgb.log_evaluation(100)
-        ]
-    )    
-
-    # prédictions
-    y_pred = model.predict(X_valid)
-
-    # métriques
-    metrics = {
-        "logloss": log_loss(y_valid, y_pred),
-        "auc": roc_auc_score(y_valid, y_pred),
-        "accuracy": accuracy_score(y_valid, (y_pred > 0.5).astype(int)),
-        "brier": brier_score_loss(y_valid, y_pred)
-    }
-
-    print("\nValidation metrics")
-    for k, v in metrics.items():
-        print(f"{k}: {v:.5f}")
-
-    # importance
     importance = pd.DataFrame({
-        "feature": features,
-        "importance": model.feature_importance()
+        "feature":    features,
+        "importance": mean_importance
     }).sort_values("importance", ascending=False)
 
-    print("\nFeature importance")
+    print("\nFeature importance (moyenne des folds)")
     print(importance)
 
-    return model
+    return models, oof_preds
+    # return models
 
 # ─────────────────────────────────────────────
 # STAGES SUBMISSION DATA 
@@ -242,34 +281,65 @@ def build_testing_set(sample, team_stats):
     return df
 
 # ─────────────────────────────────────────────
-# SUBMISSION
+# TRAIN META-MODEL (Stacking - Niveau 2)
 # ─────────────────────────────────────────────
+def train_meta_model(oof_preds, y, extra_features=None):
+    """
+    oof_preds      : np.array (n_train,) — OOF des modèles de base
+    y              : pd.Series           — cible
+    extra_features : pd.DataFrame        — features supplémentaires optionnelles
+    """
+    meta_X = oof_preds.reshape(-1, 1)
 
-def generate_submission(test, model, submission_path, clip):
+    if extra_features is not None:
+        meta_X = np.hstack([meta_X, extra_features.values])
+
+    meta_model = LogisticRegression(C=1.0, max_iter=1000)
+    meta_model.fit(meta_X, y)
+
+    oof_meta_preds = meta_model.predict_proba(meta_X)[:, 1]
+    print(f"\nMeta-model OOF AUC : {roc_auc_score(y, oof_meta_preds):.5f}")
+    print(f"Poids appris       : {meta_model.coef_}")
+
+    return meta_model
+
+
+# ─────────────────────────────────────────────
+# GENERATE SUBMISSION WITH STACKING
+# ─────────────────────────────────────────────
+def generate_submission(test, models, meta_model, submission_path, clip, extra_features=None):
+    """
+    models      : list  — modèles LightGBM des N folds
+    meta_model  : model — méta-modèle entraîné sur les OOF
+    """
     features = [c for c in test.columns if c.endswith("_diff")]
-
     X = test[features]
 
-    # Prédiction batch
-    preds = model.predict(X)
+    # ── Niveau 1 : moyenne des N modèles (input du méta-modèle) ──
+    l1_preds = np.mean([model.predict(X) for model in models], axis=0)
 
-    # Remplacer NaN (équipes manquantes) par 0.5
+    # ── Niveau 2 : méta-modèle ────────────────────────────────────
+    meta_X = l1_preds.reshape(-1, 1)
+    if extra_features is not None:
+        meta_X = np.hstack([meta_X, extra_features.values])
+
+    preds = meta_model.predict_proba(meta_X)[:, 1]
+
+    # ── Post-processing ───────────────────────────────────────────
     preds = np.where(np.isnan(preds), 0.5, preds)
     preds = np.clip(preds, clip, 1 - clip)
 
+    # ── Build submission ──────────────────────────────────────────
+    test = test.copy()
     test["Pred"] = preds
-
-    # Export
     test["ID"] = (
         test["Season"].astype(str) + "_" +
         test["TeamLow"].astype(str) + "_" +
         test["TeamHigh"].astype(str)
-    )    
+    )
     submission = test[["ID", "Pred"]]
     submission.to_csv(submission_path, index=False)
-
     print(f"Soumission sauvegardée : {submission_path}")
-
     return submission
 
 # ─────────────────────────────────────────────
@@ -282,6 +352,7 @@ print("="*60)
 
 # print("\n[01.1] Loading teams elo")
 # team_stats = load_team_elo()
+
 print("\n[01.2] Loading teams stats")
 team_stats = load_team_stats()
 
@@ -293,7 +364,6 @@ print("\n[01.4] Loading road warrior index")
 rwi = load_road_warrior_index()
 team_stats = team_stats.merge(rwi, on=["Season", "TeamID"], how="left")
 
-
 print("\n[02] Loading tourneys")
 tourney = load_tourney()
     
@@ -301,23 +371,34 @@ print("\n[03] Building dataset train")
 train = build_training_set(tourney, team_stats)
 print(f"train shape : {train.shape}, {list(train.columns)}")
     
-print("\n[04] Training model")
-model = train_model(train)
+print("\n[04.1] Training model")
+models, oof_preds = train_model_cv(train)
+
+print("\n[04.2] Training meta model")
+y = train["target"]
+meta_model = train_meta_model(oof_preds, y)
+
+# Compare L1 vs L2
+print("\n[04.3] Comparaison")
+auc_l1 = roc_auc_score(y, oof_preds)
+auc_l2 = roc_auc_score(y, meta_model.predict_proba(oof_preds.reshape(-1,1))[:, 1])
+print(f"AUC L1 (LightGBM OOF) : {auc_l1:.5f}")
+print(f"AUC L2 (méta-modèle)  : {auc_l2:.5f}")
 
 print("\n[05] Loading submission templates")
 stage1, stage2 = load_submission_template()
 
-print("\n[06] Building dataset test (stage1 and stage2")
+print("\n[06] Building dataset test (stage1 and stage2)")
 test_stage1 = build_testing_set(stage1, team_stats)
 test_stage2 = build_testing_set(stage2, team_stats)
 print(f"test stage1 shape: {test_stage1.shape}, {list(test_stage1.columns)}")
 print(f"test stage2 shape: {test_stage2.shape}, {list(test_stage2.columns)}")
 
 
-print("\n[07] Generating submissions (stage1 and stage2")
-sub_stage1 = generate_submission(test_stage1, model, 'stage1_sub.csv', 0.0250)
+print("\n[07] Generating submissions (stage1 and stage2)")
+sub_stage1 = generate_submission(test_stage1, models, meta_model, 'stage1_sub.csv', 0.0250)
 print(f"Stage 1 saved: stage1_sub.csv")
-sub_stage2 = generate_submission(test_stage2, model, 'stage2_sub.csv', 0.0250)
+sub_stage2 = generate_submission(test_stage2, models, meta_model, 'stage2_sub.csv', 0.0250)
 print(f"Stage 2 saved: stage2_sub.csv")
 
 

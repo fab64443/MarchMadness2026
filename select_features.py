@@ -44,14 +44,6 @@ def load_team_stats():
     print(f"stats shape : {stats.shape}, {list(stats.columns)}")
     return stats
 
-def load_team_stats_opti():
-    # brier 2025 : 0.116735
-    stats = pd.read_csv(WORK_DIR + "team_stats_2003-2026.csv")
-    stats = stats[["Season","TeamID","Win","NetRate","DefRate",
-                   "ORPct","DRPct","Ast","Blk","WinPct" ]]
-    print(f"stats shape : {stats.shape}, {list(stats.columns)}")
-    return stats
-
 def load_team_advelo():
     # brier 2025 : 0.038587
     elo = pd.read_csv(WORK_DIR + "elo_ratings_2003_2026.csv")
@@ -129,13 +121,38 @@ def build_training_set(tourney, team_stats):
     df = df[features]
     return df
 
-    
 # ─────────────────────────────────────────────
-# TRAIN MODEL WITH CROSS-VALIDATION
+# PERMUTATION IMPORTANCE (custom, rapide)
 # ─────────────────────────────────────────────
-def train_model_cv(train_df, n_splits=5):
+def permutation_importance_fold(model, X_valid, y_valid, features, n_repeats=5):
 
-    # features
+    baseline_preds = model.predict(X_valid)
+    baseline_score = log_loss(y_valid, baseline_preds)
+
+    importances = np.zeros(len(features))
+
+    for i, col in enumerate(features):
+
+        scores = []
+
+        for _ in range(n_repeats):
+            X_perm = X_valid.copy()
+            X_perm[col] = np.random.permutation(X_perm[col].values)
+
+            preds = model.predict(X_perm)
+            score = log_loss(y_valid, preds)
+
+            scores.append(score)
+
+        importances[i] = np.mean(scores) - baseline_score
+
+    return importances
+
+# ─────────────────────────────────────────────
+# TRAIN MODEL + PERMUTATION IMPORTANCE
+# ─────────────────────────────────────────────
+def train_model_cv_with_perm(train_df, n_splits=5):
+
     features = [c for c in train_df.columns if c.endswith("_diff")]
 
     X = train_df[features]
@@ -147,7 +164,10 @@ def train_model_cv(train_df, n_splits=5):
     models = []
     fold_metrics = []
 
+    perm_importance_total = np.zeros(len(features))
+
     for fold, (train_idx, valid_idx) in enumerate(kf.split(X, y)):
+
         print(f"\n{'='*40}")
         print(f"FOLD {fold + 1} / {n_splits}")
         print(f"{'='*40}")
@@ -160,7 +180,7 @@ def train_model_cv(train_df, n_splits=5):
 
         params = {
             "objective": "binary",
-            "metric": ["binary_logloss", "auc"],
+            "metric": ["binary_logloss"],
             "learning_rate": 0.02,
             "num_leaves": 64,
             "feature_fraction": 0.8,
@@ -173,24 +193,23 @@ def train_model_cv(train_df, n_splits=5):
             params,
             train_data,
             num_boost_round=2000,
-            valid_sets=[train_data, valid_data],
-            valid_names=["train", "valid"],
+            valid_sets=[valid_data],
             callbacks=[
                 lgb.early_stopping(100),
                 lgb.log_evaluation(100)
             ]
         )
 
-        # prédictions OOF
+        # ── OOF preds
         fold_preds = model.predict(X_valid)
         oof_preds[valid_idx] = fold_preds
 
-        # métriques par fold
+        # ── metrics
         metrics = {
             "logloss": log_loss(y_valid, fold_preds),
-            "auc":     roc_auc_score(y_valid, fold_preds),
+            "auc": roc_auc_score(y_valid, fold_preds),
             "accuracy": accuracy_score(y_valid, (fold_preds > 0.5).astype(int)),
-            "brier":   brier_score_loss(y_valid, fold_preds)
+            "brier": brier_score_loss(y_valid, fold_preds)
         }
         fold_metrics.append(metrics)
 
@@ -198,157 +217,53 @@ def train_model_cv(train_df, n_splits=5):
         for k, v in metrics.items():
             print(f"  {k}: {v:.5f}")
 
+        # ── permutation importance (sur fold)
+        print("  -> computing permutation importance...")
+        perm_imp = permutation_importance_fold(
+            model, X_valid, y_valid, features, n_repeats=5
+        )
+
+        perm_importance_total += perm_imp
+
         models.append(model)
 
-    # ── métriques OOF globales ──────────────────
+    # OOF METRICS
     print(f"\n{'='*40}")
-    print("OOF METRICS (all folds)")
+    print("OOF METRICS")
     print(f"{'='*40}")
 
     oof_metrics = {
-        "logloss":  log_loss(y, oof_preds),
-        "auc":      roc_auc_score(y, oof_preds),
+        "logloss": log_loss(y, oof_preds),
+        "auc": roc_auc_score(y, oof_preds),
         "accuracy": accuracy_score(y, (oof_preds > 0.5).astype(int)),
-        "brier":    brier_score_loss(y, oof_preds)
+        "brier": brier_score_loss(y, oof_preds)
     }
 
-    fold_df = pd.DataFrame(fold_metrics)
-    for k in oof_metrics:
-        mean_v = fold_df[k].mean()
-        std_v  = fold_df[k].std()
-        oof_v  = oof_metrics[k]
-        print(f"  {k}: OOF={oof_v:.5f}  |  mean±std={mean_v:.5f}±{std_v:.5f}")
+    for k, v in oof_metrics.items():
+        print(f"{k}: {v:.5f}")
 
-    # ── importance moyenne ──────────────────────
-    mean_importance = np.mean(
-        [m.feature_importance() for m in models], axis=0
-    )
-    importance = pd.DataFrame({
-        "feature":    features,
-        "importance": mean_importance
+    # PERMUTATION IMPORTANCE (moyenne)
+    perm_importance_mean = perm_importance_total / n_splits
+
+    perm_df = pd.DataFrame({
+        "feature": features,
+        "importance": perm_importance_mean
     }).sort_values("importance", ascending=False)
 
-    print("\nFeature importance (moyenne des folds)")
-    print(importance)
+    print("\nPermutation importance (CV)")
+    print(perm_df)
 
-    return models, oof_preds
+    # FEATURE SELECTION
+    # seuil simple
+    selected_features = perm_df[
+        perm_df["importance"] > 0
+    ]["feature"].tolist()
 
-# ─────────────────────────────────────────────
-# STAGES SUBMISSION DATA 
-# ─────────────────────────────────────────────
-def load_submission_template():
-    stage1 = pd.read_csv(DATA_DIR + "SampleSubmissionStage1.csv")
-    stage2 = pd.read_csv(DATA_DIR + "SampleSubmissionStage2.csv")
-    return stage1, stage2
+    print(f"\nSelected features ({len(selected_features)}/{len(features)})")
+    print(selected_features)
 
-# ─────────────────────────────────────────────
-# BUILD TESTING DATASET 
-# ─────────────────────────────────────────────
-def build_testing_set(sample, team_stats):
-   
-    df = sample.copy()
-
-    # 1. Split ID proprement (vectorisé)
-    id_split = df["ID"].str.split("_", expand=True)
-
-    df["Season"] = id_split[0].astype(int)
-    df["TeamLow"]  = id_split[1].astype(int)  # déjà low ID
-    df["TeamHigh"]  = id_split[2].astype(int)  # déjà high ID
-
-    # Index stats
-    stats = team_stats.set_index(["Season","TeamID"])
-
-    stat_cols = [c for c in team_stats.columns if c not in ["Season","TeamID"]]
+    return models, oof_preds, perm_df, selected_features
     
-    # Join TeamLow
-    low_stats = stats.rename(columns={c: f"{c}_low" for c in stat_cols})
-
-    df = df.join(
-        low_stats,
-        on=["Season","TeamLow"]
-    )
-
-    # Join TeamHigh
-    high_stats = stats.rename(columns={c: f"{c}_high" for c in stat_cols})
-
-    df = df.join(
-        high_stats,
-        on=["Season","TeamHigh"]
-    )
-    
-    # Diff features
-    for col in stat_cols:
-        df[f"{col}_diff"] = df[f"{col}_low"] - df[f"{col}_high"]
-        
-    features = ["Season", "TeamLow", "TeamHigh" ] + \
-               [c for c in df.columns if c.endswith("_diff")]    
-
-    df = df[features]
-
-    return df
-
-# ─────────────────────────────────────────────
-# TRAIN META-MODEL (Stacking - Niveau 2)
-# ─────────────────────────────────────────────
-def train_meta_model(oof_preds, y, extra_features=None):
-    """
-    oof_preds      : np.array (n_train,) — OOF des modèles de base
-    y              : pd.Series           — cible
-    extra_features : pd.DataFrame        — features supplémentaires optionnelles
-    """
-    meta_X = oof_preds.reshape(-1, 1)
-
-    if extra_features is not None:
-        meta_X = np.hstack([meta_X, extra_features.values])
-
-    meta_model = LogisticRegression(C=1.0, max_iter=1000)
-    meta_model.fit(meta_X, y)
-
-    oof_meta_preds = meta_model.predict_proba(meta_X)[:, 1]
-    print(f"\nMeta-model OOF AUC : {roc_auc_score(y, oof_meta_preds):.5f}")
-    print(f"Poids appris       : {meta_model.coef_}")
-
-    return meta_model
-
-
-# ─────────────────────────────────────────────
-# GENERATE SUBMISSION WITH STACKING
-# ─────────────────────────────────────────────
-def generate_submission(test, models, meta_model, submission_path, clip, extra_features=None):
-    """
-    models      : list  — modèles LightGBM des N folds
-    meta_model  : model — méta-modèle entraîné sur les OOF
-    """
-    features = [c for c in test.columns if c.endswith("_diff")]
-    X = test[features]
-
-    # ── Niveau 1 : moyenne des N modèles (input du méta-modèle) ──
-    l1_preds = np.mean([model.predict(X) for model in models], axis=0)
-
-    # ── Niveau 2 : méta-modèle ────────────────────────────────────
-    meta_X = l1_preds.reshape(-1, 1)
-    if extra_features is not None:
-        meta_X = np.hstack([meta_X, extra_features.values])
-
-    preds = meta_model.predict_proba(meta_X)[:, 1]
-
-    # ── Post-processing ───────────────────────────────────────────
-    preds = np.where(np.isnan(preds), 0.5, preds)
-    preds = np.clip(preds, clip, 1 - clip)
-
-    # ── Build submission ──────────────────────────────────────────
-    test = test.copy()
-    test["Pred"] = preds
-    test["ID"] = (
-        test["Season"].astype(str) + "_" +
-        test["TeamLow"].astype(str) + "_" +
-        test["TeamHigh"].astype(str)
-    )
-    submission = test[["ID", "Pred"]]
-    submission.to_csv(submission_path, index=False)
-    print(f"Soumission sauvegardée : {submission_path}")
-    return submission
-
 # ─────────────────────────────────────────────
 # PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
@@ -357,11 +272,8 @@ print("="*60)
 print("March Mania 2026 — Models")
 print("="*60)
 
-# print("\n[01.1] Loading teams elo")
-# team_stats = load_team_elo()
-
 print("\n[01.2] Loading teams stats")
-team_stats = load_team_stats_opti()
+team_stats = load_team_stats()
 
 print("\n[01.3] Loading teams advelo")
 advelo = load_team_advelo()
@@ -379,33 +291,5 @@ train = build_training_set(tourney, team_stats)
 print(f"train shape : {train.shape}, {list(train.columns)}")
     
 print("\n[04.1] Training model")
-models, oof_preds = train_model_cv(train)
-
-print("\n[04.2] Training meta model")
-y = train["target"]
-meta_model = train_meta_model(oof_preds, y)
-
-# Compare L1 vs L2
-print("\n[04.3] Comparaison")
-auc_l1 = roc_auc_score(y, oof_preds)
-auc_l2 = roc_auc_score(y, meta_model.predict_proba(oof_preds.reshape(-1,1))[:, 1])
-print(f"AUC L1 (LightGBM OOF) : {auc_l1:.5f}")
-print(f"AUC L2 (méta-modèle)  : {auc_l2:.5f}")
-
-print("\n[05] Loading submission templates")
-stage1, stage2 = load_submission_template()
-
-print("\n[06] Building dataset test (stage1 and stage2)")
-test_stage1 = build_testing_set(stage1, team_stats)
-test_stage2 = build_testing_set(stage2, team_stats)
-print(f"test stage1 shape: {test_stage1.shape}, {list(test_stage1.columns)}")
-print(f"test stage2 shape: {test_stage2.shape}, {list(test_stage2.columns)}")
-
-
-print("\n[07] Generating submissions (stage1 and stage2)")
-sub_stage1 = generate_submission(test_stage1, models, meta_model, 'stage1_sub.csv', 0.0250)
-print(f"Stage 1 saved: stage1_sub.csv")
-sub_stage2 = generate_submission(test_stage2, models, meta_model, 'stage2_sub.csv', 0.0250)
-print(f"Stage 2 saved: stage2_sub.csv")
-
+models, oof_preds, perm_df, selected_features = train_model_cv_with_perm(train)
 

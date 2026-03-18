@@ -122,12 +122,14 @@ def build_training_set(tourney, team_stats):
     df = df[features]
     return df
 
-    
 # ─────────────────────────────────────────────
 # TRAIN MODEL — WALK-FORWARD PAR SEASON
 # ─────────────────────────────────────────────
 def train_model_walk_forward(train_df, target_seasons=range(2022, 2027), n_splits=5):
-
+    """
+    - Seasons avec données cibles (2022-2025) : CV + métriques réelles
+    - Seasons sans données cibles (2026)      : CV uniquement, pas de métriques
+    """
     features = [c for c in train_df.columns if c.endswith("_diff")]
 
     season_models  = {}
@@ -136,35 +138,37 @@ def train_model_walk_forward(train_df, target_seasons=range(2022, 2027), n_split
 
     for season in target_seasons:
         print(f"\n{'#'*50}")
-        print(f"# SEASON {season}  —  train sur < {season}")
+        print(f"# SEASON {season}  —  train sur < {season} ({min(train_df['Season'])}..{season-1})")
         print(f"{'#'*50}")
 
-        # ── Toutes les données jusqu'à la season incluse ──
-        df_train = train_df[train_df["Season"] < season].reset_index(drop=True)
+        df_past   = train_df[train_df["Season"] < season].reset_index(drop=True)
+        df_target = train_df[train_df["Season"] == season].reset_index(drop=True)
 
-        if df_train.empty:
-            print(f"  ⚠ Pas de données pour {season}, skip.")
+        if df_past.empty:
+            print(f"  ⚠ Pas de données avant {season}, skip.")
             continue
 
-        X = df_train[features]
-        y = df_train["target"]
+        # ── Season cible absente = mode "soumission" ───────
+        eval_mode = not df_target.empty
+        if not eval_mode:
+            print(f"  ℹ Season {season} absente du train → modèle entraîné sans évaluation cible.")
 
-        # ── Masque de la season cible (pour les OOF) ──────
-        target_mask = (df_train["Season"] == season).values
+        X_past = df_past[features]
+        y_past = df_past["target"]
 
-        # ── CV stratifiée ──────────────────────────────────
+        # ── CV sur les données passées ─────────────────────
         kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        oof_preds  = np.zeros(len(X))
-        fold_models  = []
-        fold_metrics = []
+        oof_preds_past = np.zeros(len(X_past))
+        fold_models    = []
+        fold_metrics   = []
 
-        for fold, (train_idx, valid_idx) in enumerate(kf.split(X, y)):
+        for fold, (train_idx, valid_idx) in enumerate(kf.split(X_past, y_past)):
             print(f"\n{'='*40}")
             print(f"  SEASON {season} | FOLD {fold + 1} / {n_splits}")
             print(f"{'='*40}")
 
-            X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
-            y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+            X_train, X_valid = X_past.iloc[train_idx], X_past.iloc[valid_idx]
+            y_train, y_valid = y_past.iloc[train_idx], y_past.iloc[valid_idx]
 
             train_data = lgb.Dataset(X_train, label=y_train)
             valid_data = lgb.Dataset(X_valid, label=y_valid)
@@ -192,32 +196,27 @@ def train_model_walk_forward(train_df, target_seasons=range(2022, 2027), n_split
                 ]
             )
 
-            fold_preds = model.predict(X_valid)
-            oof_preds[valid_idx] = fold_preds
+            fold_preds_val = model.predict(X_valid)
+            oof_preds_past[valid_idx] = fold_preds_val
 
-            metrics = {
-                "logloss":  log_loss(y_valid, fold_preds),
-                "auc":      roc_auc_score(y_valid, fold_preds),
-                "accuracy": accuracy_score(y_valid, (fold_preds > 0.5).astype(int)),
-                "brier":    brier_score_loss(y_valid, fold_preds)
-            }
-            fold_metrics.append(metrics)
-            print(f"\n  Fold {fold + 1} metrics")
-            for k, v in metrics.items():
-                print(f"    {k}: {v:.5f}")
-
+            fold_metrics.append({
+                "logloss":  log_loss(y_valid, fold_preds_val),
+                "auc":      roc_auc_score(y_valid, fold_preds_val),
+                "accuracy": accuracy_score(y_valid, (fold_preds_val > 0.5).astype(int)),
+                "brier":    brier_score_loss(y_valid, fold_preds_val)
+            })
             fold_models.append(model)
 
-        # ── Métriques OOF globales (tous folds) ───────────
+        # ── Métriques OOF internes ─────────────────────────
         fold_df = pd.DataFrame(fold_metrics)
         oof_metrics = {
-            "logloss":  log_loss(y, oof_preds),
-            "auc":      roc_auc_score(y, oof_preds),
-            "accuracy": accuracy_score(y, (oof_preds > 0.5).astype(int)),
-            "brier":    brier_score_loss(y, oof_preds)
+            "logloss":  log_loss(y_past, oof_preds_past),
+            "auc":      roc_auc_score(y_past, oof_preds_past),
+            "accuracy": accuracy_score(y_past, (oof_preds_past > 0.5).astype(int)),
+            "brier":    brier_score_loss(y_past, oof_preds_past)
         }
         print(f"\n{'='*40}")
-        print(f"  OOF METRICS — Season {season} (2003..{season})")
+        print(f"  OOF METRICS — train ({min(train_df['Season'])}..{season-1})")
         print(f"{'='*40}")
         for k in oof_metrics:
             mean_v = fold_df[k].mean()
@@ -225,23 +224,29 @@ def train_model_walk_forward(train_df, target_seasons=range(2022, 2027), n_split
             oof_v  = oof_metrics[k]
             print(f"    {k}: OOF={oof_v:.5f}  |  mean±std={mean_v:.5f}±{std_v:.5f}")
 
-        # ── Métriques isolées sur la season cible ─────────
-        y_target    = y[target_mask]
-        pred_target = oof_preds[target_mask]
+        # ── Métriques réelles sur la season cible ──────────
+        if eval_mode:
+            X_target = df_target[features]
+            y_target = df_target["target"]
+            season_preds = np.mean(
+                [model.predict(X_target) for model in fold_models], axis=0
+            )
+            if y_target.nunique() > 1:
+                season_eval = {
+                    "logloss":  log_loss(y_target, season_preds),
+                    "auc":      roc_auc_score(y_target, season_preds),
+                    "accuracy": accuracy_score(y_target, (season_preds > 0.5).astype(int)),
+                    "brier":    brier_score_loss(y_target, season_preds)
+                }
+                season_metrics[season] = season_eval
+                print(f"\n  Métriques réelles — Season {season}")
+                for k, v in season_eval.items():
+                    print(f"    {k}: {v:.5f}")
 
-        if y_target.nunique() > 1:
-            season_eval = {
-                "logloss":  log_loss(y_target, pred_target),
-                "auc":      roc_auc_score(y_target, pred_target),
-                "accuracy": accuracy_score(y_target, (pred_target > 0.5).astype(int)),
-                "brier":    brier_score_loss(y_target, pred_target)
-            }
-            season_metrics[season] = season_eval
-            print(f"\n  Métriques isolées season {season} uniquement")
-            for k, v in season_eval.items():
-                print(f"    {k}: {v:.5f}")
+            for pred, true in zip(season_preds, y_target):
+                all_oof_rows.append({"season": season, "y_true": true, "y_pred": pred})
 
-        # ── Feature importance ─────────────────────────────
+        # ── Feature importance ──────────────────────────────
         mean_importance = np.mean(
             [m.feature_importance() for m in fold_models], axis=0
         )
@@ -252,19 +257,18 @@ def train_model_walk_forward(train_df, target_seasons=range(2022, 2027), n_split
         print(f"\n  Feature importance — Season {season}")
         print(importance.head(10))
 
-        # ── Stockage ───────────────────────────────────────
         season_models[season] = fold_models
-        for pred, true in zip(pred_target, y_target):
-            all_oof_rows.append({"season": season, "y_true": true, "y_pred": pred})
 
-    # ── Résumé global ──────────────────────────────────────
-    print(f"\n{'#'*50}")
-    print("# RÉSUMÉ GLOBAL PAR SEASON (métriques isolées)")
-    print(f"{'#'*50}")
-    print(pd.DataFrame(season_metrics).T.round(5))
+    # ── Résumé global ───────────────────────────────────────
+    if season_metrics:
+        print(f"\n{'#'*50}")
+        print("# RÉSUMÉ GLOBAL PAR SEASON")
+        print(f"{'#'*50}")
+        print(pd.DataFrame(season_metrics).T.round(5))
 
     oof_preds_df = pd.DataFrame(all_oof_rows)
     return season_models, oof_preds_df
+
     
 # ─────────────────────────────────────────────
 # STAGES SUBMISSION DATA 
@@ -380,8 +384,8 @@ print("="*60)
 # team_stats = load_team_elo()
 
 print("\n[01.2] Loading teams stats")
-# team_stats = load_team_stats_opti()
-team_stats = load_team_stats()
+team_stats = load_team_stats_opti()
+# team_stats = load_team_stats()
 
 print("\n[01.3] Loading teams advelo")
 advelo = load_team_advelo()
